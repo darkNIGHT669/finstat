@@ -3,11 +3,11 @@ import json
 import os
 from typing import Callable, Optional
 import pdfplumber
-import anthropic
+from groq import Groq
 
 from normalizer import normalize_label, CANONICAL_ITEMS
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 IS_KEYWORDS = [
     "revenue", "net revenue", "total revenue", "net sales", "sales",
@@ -52,15 +52,9 @@ def score_section(text: str) -> float:
 def clean_text(text: str) -> str:
     if not text:
         return ""
-    # Normalize dashes and spaces
     text = text.replace("\u2013", "-").replace("\u2014", "-").replace("\u00a0", " ")
-    # Remove excessive whitespace lines
     lines = text.split("\n")
-    cleaned = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped:
-            cleaned.append(stripped)
+    cleaned = [line.strip() for line in lines if line.strip()]
     return "\n".join(cleaned)
 
 
@@ -89,7 +83,6 @@ def extract_all_text_and_tables(pdf_path: str) -> list[dict]:
         for page_num, page in enumerate(pdf.pages, start=1):
             raw_text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
             tables = page.extract_tables() or []
-            # Convert tables to text representation
             table_texts = []
             for table in tables:
                 rows = []
@@ -111,93 +104,140 @@ def find_candidate_pages(pages: list[dict], threshold: float = 0.18) -> list[dic
     scored = [(p, score_section(p["combined"])) for p in pages]
     candidates = [(p, s) for p, s in scored if s >= threshold]
     if not candidates:
-        # Lower threshold if nothing found
         best = max(scored, key=lambda x: x[1])
         candidates = [best] if best[1] > 0 else scored[:5]
-    # Sort by score descending, take top 8 pages
     candidates.sort(key=lambda x: x[1], reverse=True)
     top = [p for p, _ in candidates[:8]]
-    # Re-sort by page number
     top.sort(key=lambda p: p["page"])
     return top
 
 
 def build_candidate_text(candidates: list[dict]) -> tuple[str, list[int]]:
     pages_used = [c["page"] for c in candidates]
-    texts = []
-    for c in candidates:
-        texts.append(f"=== PAGE {c['page']} ===\n{c['combined']}")
+    texts = [f"=== PAGE {c['page']} ===\n{c['combined']}" for c in candidates]
     return "\n\n".join(texts), pages_used
 
 
+def extract_json_from_response(raw: str) -> dict:
+    """Robustly extract JSON from LLM response, handling markdown fences and extra text."""
+    if not raw or not raw.strip():
+        raise ValueError("LLM returned an empty response.")
+
+    # Strip markdown code fences
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    raw = re.sub(r"\s*```$", "", raw.strip())
+    raw = raw.strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find JSON object within the text
+    match = re.search(r'\{[\s\S]*\}', raw)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"Could not parse JSON. Response starts with: {raw[:300]}")
+
+
+def build_empty_result(currency: str, unit: str) -> dict:
+    """Fallback result when LLM fails — returns all nulls so pipeline does not crash."""
+    return {
+        "extraction_metadata": {
+            "currency": currency,
+            "unit": unit,
+            "fiscal_year_end": None,
+            "years_detected": [],
+            "source_context_notes": "Extraction failed — could not parse LLM response.",
+        },
+        "line_items": [
+            {
+                "canonical_name": item,
+                "source_label": None,
+                "values": {},
+                "confidence": "LOW",
+                "notes": "LLM extraction failed — please retry",
+            }
+            for item in CANONICAL_ITEMS
+        ],
+    }
+
+
 def call_llm_extract(candidate_text: str, currency: str, unit: str) -> dict:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = Groq(api_key=GROQ_API_KEY)
 
     canonical_list = "\n".join(f"- {item}" for item in CANONICAL_ITEMS)
 
-    system_prompt = """You are a financial data extraction engine for an internal analyst research portal.
-Your job is to extract income statement line items from raw financial document text.
+    system_prompt = (
+        "You are a financial data extraction engine. "
+        "You must respond with ONLY a valid JSON object. "
+        "Do not include any markdown, code fences, explanation, or commentary. "
+        "Your entire response must start with { and end with }."
+    )
 
-STRICT RULES — violating these is a critical failure:
-1. Extract ONLY values explicitly present in the document text. NEVER infer, calculate, or estimate.
-2. If a line item is NOT in the text, set its values to null — never to 0 or any estimate.
-3. Extract the exact numeric value as written (before any unit scaling). Handle parenthetical negatives: (1,234) = -1234.
-4. Identify ALL fiscal years present as separate columns.
-5. Return ONLY valid JSON. No markdown, no commentary, no explanation outside JSON.
-6. For confidence: HIGH = exact match + clear value, MEDIUM = fuzzy match or ambiguous, LOW = unclear."""
+    user_prompt = f"""Extract income statement line items from the financial document text below.
 
-    user_prompt = f"""Extract income statement data from the following financial document text.
+Currency: {currency}
+Unit: {unit}
 
-Document context:
-- Detected currency: {currency}
-- Detected unit: {unit}
-
-Canonical line items to extract (map source labels to these):
+Canonical line items to extract:
 {canonical_list}
 
 Document text:
 ---
-{candidate_text[:12000]}
+{candidate_text[:10000]}
 ---
 
-Return a JSON object with this exact structure:
+Return ONLY this JSON (no markdown, no extra text, start with {{):
 {{
   "extraction_metadata": {{
     "currency": "{currency}",
     "unit": "{unit}",
-    "fiscal_year_end": "<month or null>",
+    "fiscal_year_end": null,
     "years_detected": ["FY2023", "FY2024"],
-    "source_context_notes": "<brief note about document structure>"
+    "source_context_notes": "brief description of document"
   }},
   "line_items": [
     {{
-      "canonical_name": "<from canonical list above>",
-      "source_label": "<exact label as written in document, or null if inferred>",
+      "canonical_name": "Revenue",
+      "source_label": "exact label from doc or null",
       "values": {{"FY2023": 12345.0, "FY2024": 13456.0}},
-      "confidence": "HIGH|MEDIUM|LOW",
-      "notes": "<any important caveats, or null>"
+      "confidence": "HIGH",
+      "notes": null
     }}
   ]
 }}
 
-Include ALL canonical line items in the response — set values to null for those not found.
-Numbers should be raw numeric values as written in the document (e.g., 394328 not 394.328).
+Rules:
+- Include ALL {len(CANONICAL_ITEMS)} canonical items in the line_items array
+- Set values to null if not found — never estimate or calculate
+- Use raw numbers as written (394328 not 394.328)
+- Parenthetical (1234) = negative -1234
+- confidence must be HIGH, MEDIUM, or LOW
 """
 
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        temperature=0,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    try:
+        message = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0,
+            max_tokens=4096,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        raw = message.choices[0].message.content
+        print(f"[LLM RAW RESPONSE PREVIEW]: {raw[:300]}")
+        return extract_json_from_response(raw)
 
-    raw = message.content[0].text.strip()
-    # Strip markdown code blocks if present
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-
-    return json.loads(raw)
+    except Exception as e:
+        print(f"[LLM ERROR] {type(e).__name__}: {e}")
+        return build_empty_result(currency, unit)
 
 
 def validate_arithmetic(line_items: list[dict], years: list[str]) -> list[str]:
@@ -206,19 +246,18 @@ def validate_arithmetic(line_items: list[dict], years: list[str]) -> list[str]:
     def get_val(canonical: str, year: str) -> Optional[float]:
         for li in line_items:
             if li["canonical_name"] == canonical:
-                return li["values"].get(year)
+                v = li["values"].get(year)
+                return float(v) if v is not None else None
         return None
 
     for year in years:
         revenue = get_val("Revenue", year)
         cogs = get_val("COGS", year)
         gross_profit = get_val("Gross Profit", year)
-        operating_income = get_val("Operating Income", year)
-        net_income = get_val("Net Income", year)
 
         if revenue is not None and cogs is not None and gross_profit is not None:
             expected = revenue - cogs
-            if abs(expected - gross_profit) / (abs(revenue) + 1) > 0.02:
+            if abs(revenue) > 0 and abs(expected - gross_profit) / abs(revenue) > 0.02:
                 warnings.append(
                     f"{year}: Gross Profit mismatch — stated {gross_profit:,.0f}, computed {expected:,.0f}"
                 )
@@ -250,7 +289,6 @@ def extract_financials(pdf_path: str, progress_callback: Callable = None) -> dic
     update("Calling AI extraction engine...", 55)
     llm_result = call_llm_extract(candidate_text, currency, unit)
 
-    # Merge/normalize
     metadata = llm_result.get("extraction_metadata", {})
     line_items = llm_result.get("line_items", [])
     years = metadata.get("years_detected", [])

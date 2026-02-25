@@ -141,7 +141,7 @@ export default function App() {
   const [fileName, setFileName] = useState('')
   const fileInputRef = useRef()
   const pollRef = useRef()
-
+  /**/
   const startPolling = useCallback((id) => {
     pollRef.current = setInterval(async () => {
       try {
